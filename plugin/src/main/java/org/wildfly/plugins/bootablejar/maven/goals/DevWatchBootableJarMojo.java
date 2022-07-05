@@ -23,7 +23,13 @@ import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+
 import static java.nio.file.StandardWatchEventKinds.OVERFLOW;
+import static org.jboss.as.controller.client.helpers.ClientConstants.ADD_CONTENT;
+import static org.jboss.as.controller.client.helpers.ClientConstants.INPUT_STREAM_INDEX;
+import static org.jboss.as.controller.client.helpers.ClientConstants.TARGET_PATH;
+import static org.jboss.galleon.Constants.CONTENT;
+
 import java.nio.file.ClosedWatchServiceException;
 import java.nio.file.WatchEvent;
 import java.nio.file.WatchKey;
@@ -63,6 +69,7 @@ import org.jboss.galleon.ProvisioningException;
 import org.jboss.galleon.util.IoUtils;
 import org.jboss.galleon.util.ZipUtils;
 import org.twdata.maven.mojoexecutor.MojoExecutor;
+
 import static org.twdata.maven.mojoexecutor.MojoExecutor.artifactId;
 import static org.twdata.maven.mojoexecutor.MojoExecutor.configuration;
 import static org.twdata.maven.mojoexecutor.MojoExecutor.executeMojo;
@@ -71,6 +78,16 @@ import static org.twdata.maven.mojoexecutor.MojoExecutor.goal;
 import static org.twdata.maven.mojoexecutor.MojoExecutor.groupId;
 import static org.twdata.maven.mojoexecutor.MojoExecutor.plugin;
 import static org.twdata.maven.mojoexecutor.MojoExecutor.version;
+
+import java.nio.file.FileVisitResult;
+import java.nio.file.FileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
+import javax.security.auth.callback.Callback;
+import javax.security.auth.callback.NameCallback;
+import javax.security.auth.callback.PasswordCallback;
+import javax.security.auth.callback.UnsupportedCallbackException;
+import javax.security.sasl.RealmCallback;
+import org.jboss.as.controller.client.OperationBuilder;
 import org.wildfly.core.launcher.Launcher;
 import org.wildfly.plugins.bootablejar.maven.common.Utils;
 import org.wildfly.plugins.bootablejar.maven.goals.DevWatchContext.BootableAppEventHandler;
@@ -187,9 +204,33 @@ public final class DevWatchBootableJarMojo extends AbstractDevBootableJarMojo {
     @Parameter(alias= "debug-suspend", defaultValue = "false", property = "wildfly.bootable.debug.suspend")
     private boolean debugSuspend;
 
+    /**
+     * Enable/Disable remote connection.
+     */
+    @Parameter(defaultValue = "false", property = "wildfly.bootable.remote")
+    private boolean remote;
+
+    /**
+     * Remote connection username.
+     */
+    @Parameter(property = "wildfly.bootable.remote.username")
+    private String username;
+
+    /**
+     * Remote connection  password.
+     */
+    @Parameter(property = "wildfly.bootable.remote.password")
+    private String password;
+
+    /**
+     * Remote connection  protocol.
+     */
+    @Parameter(defaultValue = "remote+http", property = "wildfly.bootable.remote.protocol")
+    private String protocol;
+
     private Process process;
     private Path currentServerDir;
-    private final DeploymentController deploymentController = new DeploymentController();
+    private DeploymentController deploymentController;
 
     // Test specific content to have the process to exit on Windows
     static final String TEST_PROPERTY_EXIT = "dev-watch.test.exit.on.file";
@@ -200,9 +241,13 @@ public final class DevWatchBootableJarMojo extends AbstractDevBootableJarMojo {
         addExtraLayer(MANAGEMENT_LAYER);
     }
 
-    private class DeploymentController {
+    private interface DeploymentController {
+        void deploy(Path dir) throws Exception;
+    }
 
-        void deploy(Path dir) throws Exception {
+    private class LocalDeploymentController implements DeploymentController {
+        @Override
+        public void deploy(Path dir) throws Exception {
             if (process == null) {
                 return;
             }
@@ -222,14 +267,14 @@ public final class DevWatchBootableJarMojo extends AbstractDevBootableJarMojo {
             }
         }
 
-        void waitRemoved(ModelControllerClient client, String name) throws Exception {
+        private void waitRemoved(ModelControllerClient client, String name) throws Exception {
             ModelNode address = new ModelNode();
             address.add("deployment", name);
             waitStatus(client, "failed", Operations.createOperation("read-resource", address));
             getLog().debug("Deployment " + name + " removed");
         }
 
-        void waitDeploymentUp(ModelControllerClient client, String name) throws Exception {
+        private void waitDeploymentUp(ModelControllerClient client, String name) throws Exception {
             ModelNode address = new ModelNode();
             address.add("deployment", name);
             ModelNode op = Operations.createOperation("read-attribute", address);
@@ -248,7 +293,7 @@ public final class DevWatchBootableJarMojo extends AbstractDevBootableJarMojo {
             }
         }
 
-        void undeploy(ModelControllerClient client, String name) throws Exception {
+       private void undeploy(ModelControllerClient client, String name) throws Exception {
             ModelNode composite = Operations.createCompositeOperation();
             ModelNode steps = composite.get("steps");
             ModelNode address = new ModelNode();
@@ -260,7 +305,7 @@ public final class DevWatchBootableJarMojo extends AbstractDevBootableJarMojo {
             getLog().debug("Undeploy " + name + " done");
         }
 
-        boolean deploy(ModelControllerClient client, Path dir) throws Exception {
+        private boolean deploy(ModelControllerClient client, Path dir) throws Exception {
             ModelNode composite = Operations.createCompositeOperation();
             ModelNode steps = composite.get("steps");
             ModelNode address = new ModelNode();
@@ -293,6 +338,131 @@ public final class DevWatchBootableJarMojo extends AbstractDevBootableJarMojo {
         }
     }
 
+    private class RemoteDeploymentController implements DeploymentController {
+        private final String name;
+
+        public RemoteDeploymentController(String name) {
+            this.name = name;
+        }
+
+        @Override
+        public void deploy(Path dir) throws Exception {
+            try (ModelControllerClient client = createClient()) {
+                ServerHelper.waitForStandalone(client, timeout);
+                undeploy(client, name);
+                waitRemoved(client, name);
+                boolean success = deploy(client, dir);
+                if (success) {
+                    waitDeploymentUp(client, name);
+                }
+                // We only need this on Windows since it may lock the JAR when the delete process is running
+                if (IS_WINDOWS) {
+                    currentServerDir = getHomeDirectory(client);
+                }
+            }
+        }
+
+        private void waitRemoved(ModelControllerClient client, String name) throws Exception {
+            ModelNode address = new ModelNode();
+            address.add("deployment", name);
+            waitStatus(client, "failed", Operations.createOperation("read-resource", address));
+            getLog().debug("Deployment " + name + " removed");
+        }
+
+        private void waitDeploymentUp(ModelControllerClient client, String name) throws Exception {
+            ModelNode address = new ModelNode();
+            address.add("deployment", name);
+            ModelNode op = Operations.createOperation("read-attribute", address);
+            op.get("name").set("status");
+            ModelNode reply = waitStatus(client, "success", op);
+            ModelNode result = reply.get("result");
+            if (result.isDefined()) {
+                String status = result.asString();
+                if ("OK".equals(status)) {
+                    getLog().debug("Deployment " + name + " is up");
+                } else {
+                    getLog().warn("Deployment " + name + " failed, status is " + status);
+                }
+            } else {
+                throw new MojoExecutionException("No status returned for deployment " + name);
+            }
+        }
+
+       private void undeploy(ModelControllerClient client, String name) throws Exception {
+            ModelNode composite = Operations.createCompositeOperation();
+            ModelNode steps = composite.get("steps");
+            ModelNode address = new ModelNode();
+            address.add("deployment", name);
+            steps.add(Operations.createOperation("undeploy", address));
+            steps.add(Operations.createOperation("remove", address));
+            getLog().debug("Undeploy " + name);
+            ModelNode response = client.execute(composite);
+            getLog().debug("Undeploy " + name + " done " + response.toJSONString(true));
+        }
+
+        private boolean deploy(ModelControllerClient client, Path deploymentDir) throws Exception {
+            ModelNode composite = Operations.createCompositeOperation();
+            OperationBuilder builder = new OperationBuilder(composite, true);
+            ModelNode steps = composite.get("steps");
+            ModelNode address = new ModelNode();
+            address.add("deployment", name);
+            final ModelNode op = Operations.createOperation("add", address);
+            op.get("runtime-name").set("ROOT.war");
+            ModelNode content = op.get("content").get(0);
+            content.get("empty").set(true);
+            getLog().debug("Deploy " + name);
+            steps.add(op);
+            ModelNode addContentOp = Operations.createOperation(ADD_CONTENT, address);
+            Files.walkFileTree(deploymentDir, new FileVisitor<Path>() {
+                private int index = 0;
+                private int stream = 0;
+
+                @Override
+                public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                    builder.addFileAsAttachment(file);
+                    getLog().debug("Sending file " + file + " to " + deploymentDir.relativize(file).toString() + " with index " + stream);
+                    addContentOp.get(CONTENT).get(index).get(INPUT_STREAM_INDEX).set(stream++);
+                    addContentOp.get(CONTENT).get(index).get(TARGET_PATH).set(deploymentDir.relativize(file).toString());
+                    index++;
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFileFailed(Path file, IOException exc) throws IOException {
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+            steps.add(addContentOp);
+            steps.add(Operations.createOperation("deploy", address));
+            ModelNode reply = client.execute(builder.build());
+            getLog().debug("Deploy " + name + " done " + reply.toJSONString(true));
+            return "success".equals(reply.get("outcome").asString());
+        }
+
+        ModelNode waitStatus(ModelControllerClient client, String status, ModelNode op) throws Exception {
+            int t = timeout * 1000;
+            int waitTime = 100;
+            while (t >= 0) {
+                ModelNode reply = client.execute(op);
+                if (status.equals(reply.get("outcome").asString())) {
+                    return reply;
+                }
+                Thread.sleep(waitTime);
+                t -= waitTime;
+            }
+            throw new MojoExecutionException("Timeout waiting for " + op + " to return " + status + " status");
+        }
+    }
     private class ProjectContextImpl implements DevWatchContext.ProjectContext {
 
         private final MavenProject currentProject;
@@ -447,7 +617,17 @@ public final class DevWatchBootableJarMojo extends AbstractDevBootableJarMojo {
     }
 
     @Override
+    public void execute() throws MojoExecutionException, MojoFailureException {
+        if (remote) {
+            hollowJar = true;
+            doExecute();
+            return;
+        }
+        super.execute();
+    }
+    @Override
     protected void doExecute() throws MojoExecutionException, MojoFailureException {
+        this.deploymentController = remote ? new RemoteDeploymentController(project.getBuild().getFinalName() + '.' + project.getPackaging()) : new LocalDeploymentController();
         boolean isRebuild = System.getProperty(REBUILD_MARKER) != null;
         if (isRebuild) {
             return;
@@ -471,9 +651,11 @@ public final class DevWatchBootableJarMojo extends AbstractDevBootableJarMojo {
                     Paths.get(projectBuildDir), sourceDir.toPath(), contextRoot, cliSessions, extraServerContentDirs);
             DevWatchContext ctx = new DevWatchContext(projectContext, watcher);
             ctx.build(true);
-            process = Launcher.of(buildCommandBuilder(false))
-                    .inherit()
-                    .launch();
+            if (!remote) {
+                process = Launcher.of(buildCommandBuilder(false))
+                        .inherit()
+                        .launch();
+            }
             deploymentController.deploy(ctx.getTargetDirectory());
             watch(watcher, ctx);
         } catch (Exception e) {
@@ -532,9 +714,10 @@ public final class DevWatchBootableJarMojo extends AbstractDevBootableJarMojo {
                 }
 
                 try {
-                    if (handler.rebuildBootableJAR || mustRebuildJar) {
+                    if (!remote && (handler.rebuildBootableJAR || mustRebuildJar)) {
                         // We must first stop the server, on Windows platform
                         // we can't rebuild a Bootable JAR although the server is running.
+                        //If the server is remote, of course rebuilding it doesn't make sense
                         getLog().info("[WATCH] stopping bootable JAR");
                         shutdownContainer();
                         getLog().info("[WATCH] server stopped");
@@ -998,6 +1181,26 @@ public final class DevWatchBootableJarMojo extends AbstractDevBootableJarMojo {
     }
 
     private ModelControllerClient createClient() throws UnknownHostException {
+        if (remote && username != null && password != null) {
+            return ModelControllerClient.Factory.create(protocol, hostname, port, (Callback[] callbacks) -> {
+                for (Callback current : callbacks) {
+                    if (current instanceof NameCallback) {
+                        NameCallback ncb = (NameCallback) current;
+                        ncb.setName(username);
+                        getLog().debug("set user " + username);
+                    } else if (current instanceof PasswordCallback) {
+                        PasswordCallback pcb = (PasswordCallback) current;
+                        pcb.setPassword(password.toCharArray());
+                        getLog().debug("set password " + password);
+                    } else if (current instanceof RealmCallback) {
+                        RealmCallback rcb = (RealmCallback) current;
+                        rcb.setText(rcb.getDefaultText());
+                    } else {
+                        throw new UnsupportedCallbackException(current);
+                    }
+                }
+            });
+        }
         return ModelControllerClient.Factory.create(hostname, port);
     }
 
